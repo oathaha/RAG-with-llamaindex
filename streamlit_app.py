@@ -1,56 +1,134 @@
 import streamlit as st
-from openai import OpenAI
+
+from llama_index.core import  VectorStoreIndex, get_response_synthesizer
+from llama_index.core.query_pipeline import InputComponent, QueryPipeline
+from llama_index.core.prompts import PromptTemplate
+from llama_index.core.postprocessor import SimilarityPostprocessor,  MetadataReplacementPostProcessor
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.openai import OpenAI
+
+import qdrant_client
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+import os, time
 
 # Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+st.title("💬 Australian visa assistance")
+st.header("I am an Australian visa assistance. You can ask me about visa in Australia.")
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+openai_api_key = st.secrets["OPENAI_API_KEY"]
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+with st.spinner("Setting up LLM and embedding model"):
+    embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-mpnet-base-v2")
+    llm = OpenAI(model="gpt-4o-mini", api_key=openai_api_key)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+with st.spinner("Setting up vector store"):
+    client = qdrant_client.QdrantClient(
+        url = st.secrets["QDRANT_URL"],
+        api_key = st.secrets["QDRANT_API_KEY"]
+    )
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    vector_store = QdrantVectorStore(
+        client=client, 
+        collection_name="visa-info",
+        enable_hybrid=True
+    )
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+    index = VectorStoreIndex.from_vector_store(
+        vector_store=vector_store,
+        embed_model=embed_model,
+    )
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+## prepare pipeline component
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+with st.spinner("Setting up RAG pipeline"):
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    input_comp = InputComponent()
+
+    response_synthesizer = get_response_synthesizer(response_mode="compact")
+
+    similarity_postprocessor = SimilarityPostprocessor(similarity_cutoff=0.7)
+
+    metadata_replacement_postprocessor = MetadataReplacementPostProcessor(
+        target_metadata_key="window_context",
+    )
+
+    post_processors = [similarity_postprocessor, metadata_replacement_postprocessor]
+
+
+    retriever = VectorIndexRetriever(
+        index = index,
+        similarity_top_k = 10,
+        vector_store_query_mode = 'hybrid',
+        alpha = 0.8, 
+        hybrid_top_k = 10
+    )
+
+    query_engine = RetrieverQueryEngine(
+        retriever = retriever,
+        node_postprocessors = post_processors,
+        response_synthesizer = response_synthesizer
+    )
+
+
+    ## define custom prompt
+
+    custom_prompt = """You are an assistant for question-answering tasks related to visa application in Australia.
+
+    Use the following pieces of retrieved context to answer the user's query:
+
+    ---------------------\n
+    {context_str}\n
+    ---------------------\n
+
+    Query: {query_str}
+    """
+
+    custom_prompt_template = PromptTemplate(custom_prompt)
+
+    query_engine.update_prompts({"response_synthesizer:text_qa_template": custom_prompt_template})
+
+
+
+    ## create pipeline
+
+    pipeline = QueryPipeline(
+        chain = [input_comp, query_engine, llm],
+        verbose=False
+    )
+
+st.success('Chatbot is ready. You can ask questions now.')
+
+if "messages" not in st.session_state.keys(): # Initialize the chat message history
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hi. I am an Australian visa assistance. You can ask me about visa in Australia."}
+    ]
+
+prompt = st.chat_input("Please enter your question here.")
+
+if prompt: # Prompt for user input and save to chat history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+for message in st.session_state.messages: # Display the prior chat messages
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+
+# If last message is not from assistant, generate a new response
+if st.session_state.messages[-1]["role"] != "assistant":
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+
+            ## get response from pipeline
+            response = pipeline.run(input=prompt)
+
+            response_str = str(response)
+
+            if 'assistant: ' in response_str:
+                response_str = response_str.replace('assistant: ', '')
+                
+            st.write(response_str)
+            message = {"role": "assistant", "content": response_str}
+            st.session_state.messages.append(message) # Add response to message history
