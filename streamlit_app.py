@@ -12,11 +12,10 @@ from llama_index.llms.openai import OpenAI
 
 import qdrant_client
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-import os, time
 
 # Show title and description.
 st.title("💬 Australian visa assistance")
-st.header("I am an Australian visa assistance. You can ask me about visa in Australia.")
+st.header("Ask me anything about Australian visa.")
 
 openai_api_key = st.secrets["OPENAI_API_KEY"]
 
@@ -24,7 +23,7 @@ with st.spinner("Setting up LLM and embedding model"):
     embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-mpnet-base-v2")
     llm = OpenAI(model="gpt-4o-mini", api_key=openai_api_key)
 
-with st.spinner("Setting up vector store"):
+with st.spinner("Connecting to vector store"):
     client = qdrant_client.QdrantClient(
         url = st.secrets["QDRANT_URL"],
         api_key = st.secrets["QDRANT_API_KEY"]
@@ -43,7 +42,7 @@ with st.spinner("Setting up vector store"):
 
 ## prepare pipeline component
 
-with st.spinner("Setting up RAG pipeline"):
+with st.spinner("Building RAG pipeline"):
 
     input_comp = InputComponent()
 
